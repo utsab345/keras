@@ -207,10 +207,14 @@ class NNOpsDynamicShapeTest(testing.TestCase):
         self.assertEqual(knn.log_softmax(x).shape, (None, 2, 3))
         self.assertEqual(knn.log_softmax(x, axis=1).shape, (None, 2, 3))
         self.assertEqual(knn.log_softmax(x, axis=-1).shape, (None, 2, 3))
+        with self.assertRaises(ValueError):
+            knn.log_softmax(x, axis=3)
 
     def test_sparsemax(self):
         x = KerasTensor([None, 2, 3])
         self.assertEqual(knn.sparsemax(x).shape, (None, 2, 3))
+        with self.assertRaises(ValueError):
+            knn.sparsemax(x, axis=3)
 
     def test_max_pool(self):
         data_format = backend.config.image_data_format()
@@ -1150,6 +1154,52 @@ class NNOpsStaticShapeTest(testing.TestCase):
             (2, 4, 5, 5) if data_format == "channels_last" else (2, 5, 4, 5),
         )
 
+    def test_conv_input_channel_validation(self):
+        data_format = backend.config.image_data_format()
+        if data_format == "channels_last":
+            input_shape = (2, 10, 3)
+        else:
+            input_shape = (2, 3, 10)
+        inputs = KerasTensor(input_shape)
+        # kernel input channels (5) do not match the input's channels (3)
+        bad_kernel = KerasTensor([3, 5, 4])
+        bad_depthwise_kernel = KerasTensor([3, 5, 1])
+        pointwise_kernel = KerasTensor([1, 5, 4])
+
+        with self.assertRaisesRegex(
+            ValueError, "input channels must match the kernel"
+        ):
+            knn.conv(inputs, bad_kernel, padding="valid")
+
+        with self.assertRaisesRegex(
+            ValueError, "input channels must match the kernel"
+        ):
+            knn.depthwise_conv(inputs, bad_depthwise_kernel, padding="valid")
+
+        with self.assertRaisesRegex(
+            ValueError, "input channels must match the kernel"
+        ):
+            knn.separable_conv(
+                inputs,
+                bad_depthwise_kernel,
+                pointwise_kernel,
+                padding="valid",
+            )
+
+        # Dynamic channel dimension should NOT raise.
+        if data_format == "channels_last":
+            dyn_inputs = KerasTensor((2, 10, None))
+        else:
+            dyn_inputs = KerasTensor((2, None, 10))
+        knn.conv(dyn_inputs, bad_kernel, padding="valid")
+        knn.depthwise_conv(dyn_inputs, bad_depthwise_kernel, padding="valid")
+        knn.separable_conv(
+            dyn_inputs,
+            bad_depthwise_kernel,
+            pointwise_kernel,
+            padding="valid",
+        )
+
     def test_conv_transpose(self):
         data_format = backend.config.image_data_format()
         if data_format == "channels_last":
@@ -1198,6 +1248,29 @@ class NNOpsStaticShapeTest(testing.TestCase):
             ),
         )
 
+    def test_conv_transpose_input_channel_validation(self):
+        data_format = backend.config.image_data_format()
+        if data_format == "channels_last":
+            input_shape = (2, 4, 3)
+        else:
+            input_shape = (2, 3, 4)
+        inputs = KerasTensor(input_shape)
+        # conv_transpose kernel layout: (spatial..., out_channels, in_channels)
+        # in_channels=5 mismatches the input's 3 channels.
+        bad_kernel = KerasTensor([2, 4, 5])
+
+        with self.assertRaisesRegex(
+            ValueError, "input channels must match the kernel"
+        ):
+            knn.conv_transpose(inputs, bad_kernel, 2)
+
+        # Dynamic channel dimension should NOT raise.
+        if data_format == "channels_last":
+            dyn_inputs = KerasTensor((2, 4, None))
+        else:
+            dyn_inputs = KerasTensor((2, None, 4))
+        knn.conv_transpose(dyn_inputs, bad_kernel, 2)
+
     def test_batched_and_unbatched_inputs_multi_hot(self):
         x = KerasTensor([2, 3, 1])
         unbatched_input = KerasTensor(
@@ -1233,6 +1306,14 @@ class NNOpsStaticShapeTest(testing.TestCase):
         self.assertEqual(
             knn.sparse_categorical_crossentropy(x1, x2).shape, (2, 3)
         )
+        x1 = KerasTensor([2, 4], dtype="int32")
+        x2 = KerasTensor([2, 3, 4])
+        self.assertEqual(
+            knn.sparse_categorical_crossentropy(x1, x2, axis=1).shape,
+            (2, 4),
+        )
+        with self.assertRaises(ValueError):
+            knn.sparse_categorical_crossentropy(x1, x2, axis=3)
 
     def test_moments(self):
         x = KerasTensor([2, 3, 4])
@@ -1324,6 +1405,33 @@ class NNOpsStaticShapeTest(testing.TestCase):
 
 
 class NNOpsCorrectnessTest(testing.TestCase):
+    @pytest.mark.skipif(not testing.jax_uses_tpu(), reason="JAX on TPU only")
+    def test_dot_product_attention_inside_scan(self):
+        import jax
+        import jax.numpy as jnp
+
+        def attention_scan_body(carry, x):
+            query, key, value = x
+            # dot_product_attention expects 4D inputs (B, H, S, D)
+            query = jnp.expand_dims(query, axis=0)
+            key = jnp.expand_dims(key, axis=0)
+            value = jnp.expand_dims(value, axis=0)
+
+            # Use a mask to trigger the issue
+            mask = jnp.ones((1, 4, 8), dtype="bool")
+            out = knn.dot_product_attention(query, key, value, mask=mask)
+
+            out = jnp.squeeze(out, axis=0)
+            return carry, out
+
+        query = jnp.ones((2, 1, 4, 8))
+        key = jnp.ones((2, 1, 4, 8))
+        value = jnp.ones((2, 1, 4, 8))
+
+        # Scan over the first dimension
+        _, out = jax.lax.scan(attention_scan_body, None, (query, key, value))
+        self.assertEqual(out.shape, (2, 1, 4, 8))
+
     def test_relu(self):
         x = np.array([-1, 0, 1, 2, 3], dtype=np.float32)
         self.assertAllClose(knn.relu(x), [0, 0, 1, 2, 3])
@@ -1552,6 +1660,10 @@ class NNOpsCorrectnessTest(testing.TestCase):
             )
             self.assertAllClose(normalized_sum_by_axis, 1.0)
 
+    @pytest.mark.skipif(
+        not backend.SUPPORTS_COMPLEX_DTYPES,
+        reason=f"{backend.backend()} backend doesn't support complex dtypes.",
+    )
     def test_polar_corectness(self):
         abs_ = np.array([1, 2], dtype="float32")
         angle = np.array([2, 3], dtype="float32")
@@ -1715,7 +1827,7 @@ class NNOpsCorrectnessTest(testing.TestCase):
             dilation_rate=1,
             groups=1,
         )
-        self.assertAllClose(outputs, expected)
+        self.assertAllClose(outputs, expected, tpu_atol=1e-2, tpu_rtol=1e-2)
 
     @parameterized.product(strides=(1, 2), dilation_rate=(1, (2, 1)))
     def test_conv_2d_group_2(self, strides, dilation_rate):
@@ -1777,7 +1889,14 @@ class NNOpsCorrectnessTest(testing.TestCase):
             dilation_rate=1,
             groups=1,
         )
-        self.assertAllClose(outputs, expected, rtol=1e-5, atol=1e-5)
+        self.assertAllClose(
+            outputs,
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )
 
         # Test for tracing error on tensorflow backend.
         if backend.backend() == "tensorflow":
@@ -1790,7 +1909,14 @@ class NNOpsCorrectnessTest(testing.TestCase):
                 )
 
             outputs = conv(inputs_3d)
-            self.assertAllClose(outputs, expected, rtol=1e-5, atol=1e-5)
+            self.assertAllClose(
+                outputs,
+                expected,
+                rtol=1e-5,
+                atol=1e-5,
+                tpu_atol=1e-2,
+                tpu_rtol=1e-2,
+            )
 
     @parameterized.product(
         strides=(1, (1, 1), (2, 2)),
@@ -1829,7 +1955,7 @@ class NNOpsCorrectnessTest(testing.TestCase):
             data_format=backend.config.image_data_format(),
             dilation_rate=dilation_rate,
         )
-        self.assertAllClose(outputs, expected)
+        self.assertAllClose(outputs, expected, tpu_atol=1e-2, tpu_rtol=1e-2)
 
     @parameterized.product(
         strides=(1, 2),
@@ -1881,7 +2007,7 @@ class NNOpsCorrectnessTest(testing.TestCase):
             dilation_rate=dilation_rate,
             groups=1,
         )
-        self.assertAllClose(outputs, expected)
+        self.assertAllClose(outputs, expected, tpu_atol=1e-2, tpu_rtol=1e-2)
 
     @parameterized.product(padding=("valid", "same"))
     def test_conv_transpose_1d(self, padding):
@@ -2279,7 +2405,12 @@ class NNOpsCorrectnessTest(testing.TestCase):
         output_length = np.array([3, 2])
 
         result = knn.ctc_loss(labels, outputs, label_length, output_length)
-        self.assertAllClose(result, np.array([3.4411672, 1.91680186]))
+        self.assertAllClose(
+            result,
+            np.array([3.4411672, 1.91680186]),
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )
 
     def test_ctc_decode(self):
         inputs = np.array(
@@ -2325,9 +2456,6 @@ class NNOpsCorrectnessTest(testing.TestCase):
         )
         self.assertAllClose(decoded, repeated_labels)
         self.assertAllClose(scores, score_labels)
-
-        if backend.backend() == "torch":
-            self.skipTest("torch doesn't support 'beam_search' strategy")
 
         labels = np.array(
             [
@@ -2439,9 +2567,10 @@ class NNOpsCorrectnessTest(testing.TestCase):
             mask = mask[None, None, ...]
             mask = np.tile(mask, (2, 4, 1, 1))
         if bias is not None:
-            if backend.backend() == "torch":
+            if backend.backend() == "torch" and mask is not None:
                 self.skipTest(
-                    "torch does not support `bias` with `dot_product_attention`"
+                    "torch does not support `mask` and `bias` with "
+                    "`dot_product_attention`"
                 )
             bias = np.arange(math.prod(bias_shape), dtype=float).reshape(
                 bias_shape
@@ -2456,6 +2585,11 @@ class NNOpsCorrectnessTest(testing.TestCase):
             elif backend.backend() == "torch":
                 import torch
 
+                if bias is not None:
+                    self.skipTest(
+                        "Flash attention doesn't support `bias` in torch "
+                        "backend."
+                    )
                 if mask is not None:
                     self.skipTest(
                         "Flash attention doesn't support `mask=None` in torch "
@@ -2752,9 +2886,6 @@ class NNOpsDtypeTest(testing.TestCase):
         import jax.nn as jnn
         import jax.numpy as jnp
 
-        if dtype == "bfloat16":
-            self.skipTest("Weirdness with numpy")
-
         x = knp.ones((2), dtype=dtype)
         x_jax = jnp.ones((2), dtype=dtype)
         expected_dtype = standardize_dtype(jnn.squareplus(x_jax).dtype)
@@ -3020,6 +3151,10 @@ class NNOpsDtypeTest(testing.TestCase):
             expected_dtype,
         )
 
+    @pytest.mark.skipif(
+        not backend.SUPPORTS_COMPLEX_DTYPES,
+        reason=f"{backend.backend()} backend doesn't support complex dtypes.",
+    )
     @parameterized.named_parameters(named_product(dtype=FLOAT_DTYPES))
     def test_polar(self, dtype):
         import jax.nn as jnn
@@ -3084,9 +3219,6 @@ class NNOpsDtypeTest(testing.TestCase):
         )
         self.assertEqual(standardize_dtype(decoded.dtype), "int32")
         self.assertEqual(standardize_dtype(scores.dtype), expected_dtype)
-
-        if backend.backend() == "torch":
-            self.skipTest("torch doesn't support 'beam_search' strategy")
 
         # Test strategy="beam_search"
         decoded, scores = knn.ctc_decode(
@@ -3188,6 +3320,13 @@ class NNOpsBehaviorTest(testing.TestCase):
         with self.assertWarnsRegex(UserWarning, expected_warning_regex):
             knn.softmax(x, axis)
 
+    def test_softmax_and_normalize_reject_out_of_range_axis(self):
+        a = KerasTensor((3, 4))
+        with self.assertRaisesRegex(ValueError, "axis 10 is out of bounds"):
+            knn.softmax(a, axis=10)
+        with self.assertRaisesRegex(ValueError, "axis 10 is out of bounds"):
+            knn.normalize(a, axis=10)
+
     def test_normalize_order_validation(self):
         # Test with a non-integer order
         with self.assertRaisesRegex(
@@ -3253,8 +3392,6 @@ class NNOpsBehaviorTest(testing.TestCase):
             knn.layer_normalization(x, rms_scaling=True)
 
     def test_unfold(self):
-        if keras.config.backend() in ["openvino"]:
-            pytest.skip("Backend does not support unfold operation")
         # test 1 kernel_size=2
         x = ops.arange(8, dtype="float32")
         x = ops.reshape(x, [1, 1, 2, 4])
@@ -3444,3 +3581,292 @@ class NNOpsBehaviorTest(testing.TestCase):
             ]
         )
         self.assertAllClose(unfold_result, except_result)
+
+    def test_fold(self):
+        # test 1: non-overlapping roundtrip (stride == kernel_size)
+        x = ops.arange(16, dtype="float32")
+        x = ops.reshape(x, [1, 1, 4, 4])
+        patches = knn.unfold(x, kernel_size=2, stride=2)
+        y = knn.fold(patches, output_size=(4, 4), kernel_size=2, stride=2)
+        self.assertAllClose(y, x)
+
+        # test 2: overlapping roundtrip — fold(unfold(x)) / fold(ones) == x
+        x = ops.arange(16, dtype="float32")
+        x = ops.reshape(x, [1, 1, 4, 4])
+        patches = knn.unfold(x, kernel_size=3, stride=1)
+        folded = knn.fold(patches, output_size=(4, 4), kernel_size=3, stride=1)
+        ones = ops.ones_like(x)
+        ones_patches = knn.unfold(ones, kernel_size=3, stride=1)
+        divisor = knn.fold(
+            ones_patches, output_size=(4, 4), kernel_size=3, stride=1
+        )
+        result = folded / divisor
+        self.assertAllClose(result, x)
+
+        # test 3: multi-channel non-overlapping roundtrip
+        x = ops.arange(32, dtype="float32")
+        x = ops.reshape(x, [1, 2, 4, 4])
+        patches = knn.unfold(x, kernel_size=2, stride=2)
+        y = knn.fold(patches, output_size=(4, 4), kernel_size=2, stride=2)
+        self.assertAllClose(y, x)
+
+        # test 4: dilation + padding roundtrip
+        x = ops.arange(32, dtype="float32")
+        x = ops.reshape(x, [1, 2, 4, 4])
+        patches = knn.unfold(x, kernel_size=2, dilation=2, padding=1)
+        y = knn.fold(
+            patches,
+            output_size=(4, 4),
+            kernel_size=2,
+            dilation=2,
+            padding=1,
+        )
+        ones = ops.ones_like(x)
+        ones_patches = knn.unfold(ones, kernel_size=2, dilation=2, padding=1)
+        divisor = knn.fold(
+            ones_patches,
+            output_size=(4, 4),
+            kernel_size=2,
+            dilation=2,
+            padding=1,
+        )
+        result = y / divisor
+        self.assertAllClose(result, x)
+
+        # test 5: explicit known values — single 1x1x2x2 non-overlap
+        x = ops.convert_to_tensor(
+            [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+            dtype="float32",
+        )
+        # x shape: (1, 2, 4) — as if C=2, kernel=1x1, L=4
+        y = knn.fold(x, output_size=(2, 2), kernel_size=1, stride=1)
+        expected = ops.convert_to_tensor(
+            [[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]],
+            dtype="float32",
+        )
+        self.assertAllClose(y, expected)
+
+        # test 6: input validation — must be 3D
+        x_bad = ops.ones((1, 2, 3, 4))
+        with self.assertRaisesRegex(ValueError, "3D"):
+            knn.fold(x_bad, output_size=(4, 4), kernel_size=2)
+
+    def test_fold_tuple_params(self):
+        """Test fold with tuple parameters to cover _pair branches."""
+        # Non-square kernel and stride as tuples
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 1, 6, 8])
+        patches = knn.unfold(x, kernel_size=(2, 4), stride=(2, 4))
+        y = knn.fold(
+            patches,
+            output_size=(6, 8),
+            kernel_size=(2, 4),
+            stride=(2, 4),
+        )
+        self.assertAllClose(y, x)
+
+        # Asymmetric padding as tuple — only pad height
+        x = ops.arange(16, dtype="float32")
+        x = ops.reshape(x, [1, 1, 4, 4])
+        patches = knn.unfold(
+            x, kernel_size=(3, 2), stride=(1, 2), padding=(1, 0)
+        )
+        folded = knn.fold(
+            patches,
+            output_size=(4, 4),
+            kernel_size=(3, 2),
+            stride=(1, 2),
+            padding=(1, 0),
+        )
+        ones = ops.ones_like(x)
+        ones_p = knn.unfold(
+            ones, kernel_size=(3, 2), stride=(1, 2), padding=(1, 0)
+        )
+        divisor = knn.fold(
+            ones_p,
+            output_size=(4, 4),
+            kernel_size=(3, 2),
+            stride=(1, 2),
+            padding=(1, 0),
+        )
+        result = folded / divisor
+        self.assertAllClose(result, x)
+
+    def test_fold_no_padding(self):
+        """Test fold with padding=0 to cover the skip-padding branch."""
+        x = ops.arange(36, dtype="float32")
+        x = ops.reshape(x, [1, 1, 6, 6])
+        patches = knn.unfold(x, kernel_size=3, stride=3, padding=0)
+        y = knn.fold(
+            patches,
+            output_size=(6, 6),
+            kernel_size=3,
+            stride=3,
+            padding=0,
+        )
+        self.assertAllClose(y, x)
+
+    def test_fold_non_square_output(self):
+        """Test fold with non-square spatial dimensions."""
+        x = ops.arange(24, dtype="float32")
+        x = ops.reshape(x, [1, 1, 4, 6])
+        patches = knn.unfold(x, kernel_size=2, stride=2)
+        y = knn.fold(patches, output_size=(4, 6), kernel_size=2, stride=2)
+        self.assertAllClose(y, x)
+
+    def test_fold_batch_and_channels(self):
+        """Test fold with larger batch and channel counts."""
+        x = np.random.normal(size=(4, 8, 6, 6)).astype("float32")
+        x = ops.convert_to_tensor(x)
+        patches = knn.unfold(x, kernel_size=2, stride=2)
+        y = knn.fold(patches, output_size=(6, 6), kernel_size=2, stride=2)
+        self.assertAllClose(y, x, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+    def test_fold_divisibility_validation(self):
+        """Test fold raises on CKK not divisible by kernel product."""
+        # CKK=5, kernel=2x2 -> 5 % 4 != 0 — raises reshape error
+        x_bad = ops.ones((1, 5, 4))
+        with self.assertRaises((ValueError, Exception)):
+            knn.fold(x_bad, output_size=(4, 4), kernel_size=2)
+
+    def test_depth_to_space(self):
+        # Test channels_last (default)
+        # Input: (1, 2, 2, 12) -> Output: (1, 4, 4, 3)
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 2, 2, 12])
+        result = knn.depth_to_space(x, block_size=2)
+        self.assertEqual(result.shape, (1, 4, 4, 3))
+
+        # Verify the transformation is correct
+        # The depth channel is rearranged into spatial blocks
+        # For block_size=2, channels are split into 2x2 blocks
+        expected = np.array(
+            [
+                [
+                    [[0, 1, 2], [3, 4, 5], [12, 13, 14], [15, 16, 17]],
+                    [[6, 7, 8], [9, 10, 11], [18, 19, 20], [21, 22, 23]],
+                    [[24, 25, 26], [27, 28, 29], [36, 37, 38], [39, 40, 41]],
+                    [[30, 31, 32], [33, 34, 35], [42, 43, 44], [45, 46, 47]],
+                ]
+            ],
+            dtype="float32",
+        )
+        self.assertAllClose(result, expected)
+
+        # Test channels_first
+        # Input: (1, 12, 2, 2) -> Output: (1, 3, 4, 4)
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 12, 2, 2])
+        result = knn.depth_to_space(
+            x, block_size=2, data_format="channels_first"
+        )
+        self.assertEqual(result.shape, (1, 3, 4, 4))
+
+        # Test with different block size
+        x = ops.arange(1 * 2 * 2 * 27, dtype="float32")
+        x = ops.reshape(x, [1, 2, 2, 27])
+        result = knn.depth_to_space(x, block_size=3)
+        self.assertEqual(result.shape, (1, 6, 6, 3))
+
+    def test_space_to_depth(self):
+        # Test channels_last (default)
+        # Input: (1, 4, 4, 3) -> Output: (1, 2, 2, 12)
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 4, 4, 3])
+        result = knn.space_to_depth(x, block_size=2)
+        self.assertEqual(result.shape, (1, 2, 2, 12))
+
+        # Verify the transformation is correct
+        expected = np.array(
+            [
+                [
+                    [
+                        [0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17],
+                        [6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22, 23],
+                    ],
+                    [
+                        [24, 25, 26, 27, 28, 29, 36, 37, 38, 39, 40, 41],
+                        [30, 31, 32, 33, 34, 35, 42, 43, 44, 45, 46, 47],
+                    ],
+                ]
+            ],
+            dtype="float32",
+        )
+        self.assertAllClose(result, expected)
+
+        # Test channels_first
+        # Input: (1, 3, 4, 4) -> Output: (1, 12, 2, 2)
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 3, 4, 4])
+        result = knn.space_to_depth(
+            x, block_size=2, data_format="channels_first"
+        )
+        self.assertEqual(result.shape, (1, 12, 2, 2))
+
+        # Test with different block size
+        x = ops.arange(1 * 6 * 6 * 3, dtype="float32")
+        x = ops.reshape(x, [1, 6, 6, 3])
+        result = knn.space_to_depth(x, block_size=3)
+        self.assertEqual(result.shape, (1, 2, 2, 27))
+
+    def test_depth_to_space_space_to_depth_roundtrip(self):
+        # depth_to_space followed by space_to_depth should be identity
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 2, 2, 12])
+        y = knn.depth_to_space(x, block_size=2)
+        z = knn.space_to_depth(y, block_size=2)
+        self.assertAllClose(x, z)
+
+        # space_to_depth followed by depth_to_space should be identity
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 4, 4, 3])
+        y = knn.space_to_depth(x, block_size=2)
+        z = knn.depth_to_space(y, block_size=2)
+        self.assertAllClose(x, z)
+
+        # Test with channels_first
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 12, 2, 2])
+        y = knn.depth_to_space(x, block_size=2, data_format="channels_first")
+        z = knn.space_to_depth(y, block_size=2, data_format="channels_first")
+        self.assertAllClose(x, z)
+
+    def test_depth_to_space_block_size_validation(self):
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 2, 2, 12])
+
+        # block_size must be at least 2
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.depth_to_space(x, block_size=0)
+
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.depth_to_space(x, block_size=1)
+
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.depth_to_space(x, block_size=-1)
+
+    def test_space_to_depth_block_size_validation(self):
+        x = ops.arange(48, dtype="float32")
+        x = ops.reshape(x, [1, 4, 4, 3])
+
+        # block_size must be at least 2
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.space_to_depth(x, block_size=0)
+
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.space_to_depth(x, block_size=1)
+
+        with self.assertRaisesRegex(
+            ValueError, "`block_size` must be at least 2"
+        ):
+            knn.space_to_depth(x, block_size=-1)

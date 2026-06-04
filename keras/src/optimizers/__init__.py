@@ -8,10 +8,13 @@ from keras.src.optimizers.adamw import AdamW
 from keras.src.optimizers.ftrl import Ftrl
 from keras.src.optimizers.lion import Lion
 from keras.src.optimizers.loss_scale_optimizer import LossScaleOptimizer
+from keras.src.optimizers.multi_optimizer import MultiOptimizer
+from keras.src.optimizers.multi_optimizer import OptimizerMap
 from keras.src.optimizers.muon import Muon
 from keras.src.optimizers.nadam import Nadam
 from keras.src.optimizers.optimizer import Optimizer
 from keras.src.optimizers.rmsprop import RMSprop
+from keras.src.optimizers.schedule_free_adamw import ScheduleFreeAdamW
 from keras.src.optimizers.sgd import SGD
 from keras.src.saving import serialization_lib
 
@@ -25,10 +28,14 @@ ALL_OBJECTS = {
     Adagrad,
     Adamax,
     Adafactor,
+    Muon,
+    MultiOptimizer,
+    OptimizerMap,
     Nadam,
     Ftrl,
     Lion,
     LossScaleOptimizer,
+    ScheduleFreeAdamW,
 }
 ALL_OBJECTS_DICT = {cls.__name__.lower(): cls for cls in ALL_OBJECTS}
 

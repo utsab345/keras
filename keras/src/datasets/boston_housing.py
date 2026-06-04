@@ -42,7 +42,11 @@ def load_data(path="boston_housing.npz", test_split=0.2, seed=113):
         target scalars. The targets are float scalars typically between 10 and
         50 that represent the home prices in k$.
     """
-    assert 0 <= test_split < 1
+    if not (0 <= test_split < 1):
+        raise ValueError(
+            f"Invalid `test_split` argument: {test_split}. "
+            "It must be between 0 and 1 (exclusive of 1)."
+        )
     origin_folder = (
         "https://storage.googleapis.com/tensorflow/tf-keras-datasets/"
     )
@@ -53,7 +57,7 @@ def load_data(path="boston_housing.npz", test_split=0.2, seed=113):
             "f553886a1f8d56431e820c5b82552d9d95cfcb96d1e678153f8839538947dff5"
         ),
     )
-    with np.load(path, allow_pickle=True) as f:
+    with np.load(path, allow_pickle=False) as f:
         x = f["x"]
         y = f["y"]
 

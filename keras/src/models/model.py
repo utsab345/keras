@@ -2,14 +2,16 @@ import inspect
 import json
 import typing
 import warnings
+from collections.abc import Callable
 
 from keras.src import backend
 from keras.src import utils
 from keras.src.api_export import keras_export
 from keras.src.layers.layer import Layer
 from keras.src.models.variable_mapping import map_saveable_variables
-from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.awq_core import awq_quantize
 from keras.src.quantizers.gptq_core import gptq_quantize
+from keras.src.quantizers.utils import should_quantize_layer
 from keras.src.saving import saving_api
 from keras.src.trainers import trainer as base_trainer
 from keras.src.utils import summary_utils
@@ -422,19 +424,99 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             **kwargs,
         )
 
-    def quantize(self, mode, config=None, **kwargs):
+    def get_quantization_layer_structure(self, mode=None):
+        """Returns the quantization structure for the model.
+
+        This method is intended to be overridden by model authors to provide
+        topology information required for structure-aware quantization modes
+        like 'gptq'.
+
+        Args:
+            mode: The quantization mode.
+
+        Returns:
+            A dictionary describing the topology, e.g.:
+            `{'pre_block_layers': [list], 'sequential_blocks': [list]}`
+            or `None` if the mode does not require structure or is not
+            supported. `'pre_block_layers'` is a list of layers that
+            the inputs should be passed through, before being passed to
+            the sequential blocks. For example, inputs to an LLM must
+            first be passed through an embedding layer, followed by
+            the transformer.
+        """
+        del mode  # Unused.
+        return None
+
+    def quantize(self, mode=None, config=None, filters=None, **kwargs):
         """Quantize the weights of the model.
 
         Note that the model must be built first before calling this method.
-        `quantize` will recursively call `quantize(mode)` in all layers and
+        `quantize` will recursively call `quantize(...)` in all layers and
         will be skipped if the layer doesn't implement the function.
 
-        Args:
-            mode: The mode of the quantization. Only 'int8' is supported at this
-                time.
-        """
-        from keras.src.dtype_policies import QUANTIZATION_MODES
+        This method can be called by passing a `mode` string, which uses the
+        default configuration for that mode. Alternatively, a `config` object
+        can be passed to customize the behavior of the quantization (e.g. to
+        use specific quantizers for weights or activations).
 
+        Args:
+            mode: The mode of the quantization. Supported modes are:
+                `"int8"`, `"int4"`, `"float8"`, `"gptq"`. This is
+                optional if `config` is provided.
+            config: The configuration object specifying additional
+                quantization options. This argument allows to configure
+                the weight and activation quantizers. be an instance of
+                `keras.quantizers.QuantizationConfig`.
+            filters: Optional filters to apply to the quantization. Can be a
+                regex string, a list of regex strings, or a callable. Only the
+                layers which match the filter conditions will be quantized.
+            **kwargs: Additional keyword arguments.
+
+        Example:
+
+        Quantize a model to int8 with default configuration:
+
+        ```python
+        # Build the model
+        model = keras.Sequential([
+            keras.Input(shape=(10,)),
+            keras.layers.Dense(10),
+        ])
+        model.build((None, 10))
+
+        # Quantize with default int8 config
+        model.quantize("int8")
+        ```
+
+        Quantize a model to int8 with a custom configuration:
+
+        ```python
+        from keras.quantizers import Int8QuantizationConfig
+        from keras.quantizers import AbsMaxQuantizer
+
+        # Build the model
+        model = keras.Sequential([
+            keras.Input(shape=(10,)),
+            keras.layers.Dense(10),
+        ])
+        model.build((None, 10))
+
+        # Create a custom config
+        config = Int8QuantizationConfig(
+            weight_quantizer=AbsMaxQuantizer(
+                axis=0,
+                value_range=(-127, 127)
+            ),
+            activation_quantizer=AbsMaxQuantizer(
+                axis=-1,
+                value_range=(-127, 127)
+            ),
+        )
+
+        # Quantize with custom config
+        model.quantize(config=config)
+        ```
+        """
         # Validate inputs.
         type_check = kwargs.pop("type_check", True)
         if kwargs:
@@ -443,27 +525,20 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 f"passed to {self.__class__.__name__}: {kwargs}"
             )
 
-        if mode not in QUANTIZATION_MODES:
-            raise ValueError(
-                "Invalid quantization mode. "
-                f"Expected one of {QUANTIZATION_MODES}. Received: mode={mode}"
-            )
-
-        if mode == "gptq":
-            if not isinstance(config, GPTQConfig):
+        if filters is not None:
+            if not isinstance(filters, (str, Callable, list, tuple)):
                 raise ValueError(
-                    "Mode 'gptq' requires a valid `config` argument of type "
-                    f"`GPTQConfig`. Received: {type(config)}"
+                    "The `filters` argument must be a regex string, a list of "
+                    "regex strings, or a callable. Received: "
+                    f"{type(filters)}"
                 )
-        elif config is not None:
-            # All other modes must not receive a config
-            raise ValueError(
-                f"The `config` argument is only supported for 'gptq' mode, "
-                f"but received mode='{mode}' and a non-None config."
-            )
 
         graph_modified = False
         for layer in self._flatten_layers():
+            # Apply filters
+            if not should_quantize_layer(layer, filters):
+                continue
+
             if len(list(layer._flatten_layers())) == 1:
                 try:
                     layer.quantize(mode, type_check=type_check, config=config)
@@ -473,8 +548,29 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 except AttributeError:
                     pass
 
-        if mode == "gptq":
-            gptq_quantize(self, config)
+        if mode in ["gptq", "awq"]:
+            # Resolve model structure.
+            # 1. If quantization_layer_structure is provided inside the config,
+            # use that.
+            structure = config.quantization_layer_structure
+            # 2. If no layer structure is provided in the config, try to fetch
+            # it using the `get_quantization_layer_structure` hook.
+            if structure is None:
+                structure = self.get_quantization_layer_structure(mode)
+
+            if structure is None:
+                raise ValueError(
+                    f"For {mode=}, a valid quantization structure must be "
+                    "provided either via `config.quantization_layer_structure` "
+                    "or by overriding "
+                    "`model.get_quantization_layer_structure(mode)`. The "
+                    "structure should be a dictionary with keys "
+                    "'pre_block_layers' and 'sequential_blocks'."
+                )
+            if mode == "gptq":
+                gptq_quantize(config, structure, filters=filters)
+            elif mode == "awq":
+                awq_quantize(config, structure, filters=filters)
 
         # If any layer was changed, we must rebuild the execution functions.
         if graph_modified:
@@ -569,8 +665,8 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             filepath: `str` or `pathlib.Path` object. The path to save the
                 artifact.
             format: `str`. The export format. Supported values:
-                `"tf_saved_model"` and `"onnx"`.  Defaults to
-                `"tf_saved_model"`.
+                `"tf_saved_model"`, `"onnx"`, `"openvino"`, `"litert"`,
+                and `"torch"`. Defaults to `"tf_saved_model"`.
             verbose: `bool`. Whether to print a message during export. Defaults
                 to `None`, which uses the default value set by different
                 backends and formats.
@@ -579,6 +675,12 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 `tf.TensorSpec`, `backend.KerasTensor`, or backend tensor. If
                 not provided, it will be automatically computed. Defaults to
                 `None`.
+                Note: With `format="litert"` and the PyTorch backend, dynamic
+                input shapes are not supported. Any dynamic dimensions (i.e.,
+                `None` in input shapes) will be automatically replaced with `1`
+                during export, which may cause runtime failures for other
+                shapes. You must explicitly pass a fixed static
+                `input_signature` matching your maximum runtime shape.
             **kwargs: Additional keyword arguments.
                 - `is_static`: Optional `bool`. Specific to the JAX backend and
                     `format="tf_saved_model"`. Indicates whether `fn` is static.
@@ -593,6 +695,33 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                     provided, they will be automatically computed.
                 - `opset_version`: Optional `int`. Specific to `format="onnx"`.
                     An integer value that specifies the ONNX opset version.
+                - LiteRT-specific options: Optional keyword arguments specific
+                    to `format="litert"`. These are passed directly to the
+                    TensorFlow Lite converter on the TensorFlow backend and
+                    include options like `optimizations`,
+                    `representative_dataset`, `experimental_new_quantizer`,
+                    `allow_custom_ops`, `enable_select_tf_ops`, etc. On the
+                    PyTorch backend, LiteRT export accepts `optimizations`
+                    plus the installed `litert_torch.convert()` keyword
+                    arguments such as `strict_export`, `dynamic_shapes` (note
+                    that standard ops do not support dynamic shapes, as noted
+                    below), `lightweight_conversion`, `enable_x64`,
+                    `runtime_constant_folding`, and `quant_config`.
+                - PyTorch export options: Optional keyword arguments specific
+                    to `format="torch"`. These are passed directly to
+                    `torch.export.export` and include `strict`,
+                    `dynamic_shapes`,
+                    `prefer_deferred_runtime_asserts_over_guards`, and
+                    `preserve_module_call_signature`.
+
+        **Note on LiteRT (TFLite) Export with PyTorch Backend:**
+        With the PyTorch backend, LiteRT export (`format="litert"`) does not
+        support dynamic input shapes. If no static signature is provided,
+        any dynamic dimensions (represented as `None`) are automatically
+        replaced with `1` during export. This can lead to runtime failures
+        for other shapes. You must explicitly specify a fixed static
+        `input_signature` (matching your maximum runtime dimensions) and pad
+        your inputs to this static shape at runtime.
 
         **Note:** This feature is currently supported only with TensorFlow, JAX
         and Torch backends.
@@ -627,17 +756,69 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         }
         predictions = ort_session.run(None, ort_inputs)
         ```
+
+        Here's how to export a LiteRT (TFLite) for inference.
+
+        ```python
+        # Export the model as a LiteRT artifact
+        model.export("path/to/location", format="litert")
+
+        # Load the artifact in a different process/environment
+        interpreter = tf.lite.Interpreter(model_path="path/to/location")
+        interpreter.allocate_tensors()
+        interpreter.set_tensor(
+            interpreter.get_input_details()[0]['index'], input_data
+        )
+        interpreter.invoke()
+        output_data = interpreter.get_tensor(
+            interpreter.get_output_details()[0]['index']
+        )
+        ```
+
+        Here's how to export a PyTorch ExportedProgram for inference.
+
+        ```python
+        # Export the model as a PyTorch ExportedProgram artifact
+        model.export("path/to/model.pt2", format="torch")
+
+        # Load the artifact in a different process/environment
+        import torch
+        loaded_program = torch.export.load("path/to/model.pt2")
+        predictions = loaded_program.module()(input_tensor)
+        ```
         """
+        from keras.src.export import export_litert
         from keras.src.export import export_onnx
         from keras.src.export import export_openvino
         from keras.src.export import export_saved_model
+        from keras.src.export import export_torch
 
-        available_formats = ("tf_saved_model", "onnx", "openvino")
+        available_formats = (
+            "tf_saved_model",
+            "onnx",
+            "openvino",
+            "litert",
+            "torch",
+        )
         if format not in available_formats:
             raise ValueError(
                 f"Unrecognized format={format}. Supported formats are: "
                 f"{list(available_formats)}."
             )
+
+        # Check if LiteRT export is available (requires TensorFlow or
+        # PyTorch backend)
+        if format == "litert" and backend.backend() not in (
+            "tensorflow",
+            "torch",
+        ):
+            raise ValueError(
+                "LiteRT export requires TensorFlow or PyTorch backend."
+            )
+
+        # Check if Torch export is available (requires PyTorch backend)
+        if format == "torch" and backend.backend() != "torch":
+            raise ValueError("Torch export requires PyTorch backend.")
 
         if format == "tf_saved_model":
             export_saved_model(
@@ -660,6 +841,22 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 self,
                 filepath,
                 verbose,
+                input_signature=input_signature,
+                **kwargs,
+            )
+        elif format == "litert":
+            export_litert(
+                self,
+                filepath,
+                verbose=verbose,
+                input_signature=input_signature,
+                **kwargs,
+            )
+        elif format == "torch":
+            export_torch(
+                self,
+                filepath,
+                verbose=verbose,
                 input_signature=input_signature,
                 **kwargs,
             )
@@ -863,13 +1060,18 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                     self.non_trainable_variables, path_value_dict
                 )
             elif k == "optimizer_variables":
-                self._assign_variable_values(
-                    self.optimizer.variables, path_value_dict
-                )
+                if hasattr(self, "optimizer") and self.optimizer is not None:
+                    self._assign_variable_values(
+                        self.optimizer.variables, path_value_dict
+                    )
             elif k == "metrics_variables":
-                self._assign_variable_values(
-                    self.metrics_variables, path_value_dict
-                )
+                if (
+                    hasattr(self, "metrics_variables")
+                    and self.metrics_variables
+                ):
+                    self._assign_variable_values(
+                        self.metrics_variables, path_value_dict
+                    )
             else:
                 raise ValueError(f"Unknown variable name: {k}")
 

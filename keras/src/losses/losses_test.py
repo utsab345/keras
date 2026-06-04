@@ -1183,7 +1183,7 @@ class CategoricalCrossentropyTest(testing.TestCase):
             from_logits=True, reduction=None
         )
         loss = cce_obj(y_true, logits)
-        self.assertAllClose((0.001822, 0.000459, 0.169846), loss)
+        self.assertAllClose(loss, (0.001822, 0.000459, 0.169846))
 
     def test_label_smoothing(self):
         logits = np.array([[100.0, -100.0, -100.0]])
@@ -1308,7 +1308,7 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
             from_logits=True, reduction=None
         )
         loss = cce_obj(y_true, logits)
-        self.assertAllClose((0.001822, 0.000459, 0.169846), loss)
+        self.assertAllClose(loss, (0.001822, 0.000459, 0.169846))
 
     def test_ignore_class(self):
         y_true = np.array([[-1, 2]])
@@ -1317,7 +1317,7 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
             from_logits=True, ignore_class=-1, reduction=None
         )
         loss = cce_obj(y_true, logits)
-        self.assertAllClose([[0.0, 1.480129]], loss)
+        self.assertAllClose(loss, [[0.0, 1.480129]])
 
         y_true = np.array([[[-1], [2]]])
         logits = np.array([[[0.854, 0.698, 0.598], [0.088, 0.86, 0.018]]])
@@ -1325,7 +1325,7 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
             from_logits=True, ignore_class=-1, reduction=None
         )
         loss = cce_obj(y_true, logits)
-        self.assertAllClose([[0.0, 1.480129]], loss)
+        self.assertAllClose(loss, [[0.0, 1.480129]])
 
     def test_binary_segmentation(self):
         y_true = np.array(
@@ -1426,6 +1426,16 @@ class SparseCategoricalCrossentropyTest(testing.TestCase):
                 y_true, y_pred_reshaped
             )
             self.assertAllClose(output, expected.sum() / 16.0)
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch",
+        reason="Channels-first axis only supported on Torch.",
+    )
+    def test_squeezes_singleton_class_dim_on_user_axis(self):
+        y_true = np.random.randint(0, 2, size=(2, 1, 4, 4)).astype("float32")
+        y_pred = np.random.random((2, 2, 4, 4)).astype("float32")
+        loss = losses.sparse_categorical_crossentropy(y_true, y_pred, axis=1)
+        self.assertEqual(loss.shape, (2, 4, 4))
 
     def test_multi_class_segmentation(self):
         y_true = np.array(
@@ -1815,10 +1825,7 @@ class CategoricalFocalCrossentropyTest(testing.TestCase):
             from_logits=True, reduction=None
         )
         loss = cce_obj(y_true, logits)
-        self.assertAllClose(
-            (1.5096224e-09, 2.4136547e-11, 1.0360638e-03),
-            loss,
-        )
+        self.assertAllClose(loss, (1.5096224e-09, 2.4136547e-11, 1.0360638e-03))
 
     def test_label_smoothing(self):
         logits = np.array([[4.9, -0.5, 2.05]])
@@ -1851,7 +1858,7 @@ class CTCTest(testing.TestCase):
         logits = (np.arange(24).reshape((2, 4, 3)).astype("float32") - 12) / 100
         y_true = np.array(([[1, 2, 1, 0], [1, 2, 0, 2]]))
         output = losses.CTC()(y_true, logits)
-        self.assertAllClose(output, 2.448645)
+        self.assertAllClose(output, 2.448645, tpu_atol=1e-3, tpu_rtol=1e-3)
 
     def test_dtype_arg(self):
         logits = (np.arange(24).reshape((2, 4, 3)).astype("float32") - 12) / 100
@@ -1964,6 +1971,7 @@ class TverskyTest(testing.TestCase):
 
 class CircleTest(testing.TestCase):
     def setup(self):
+        super().setUp()
         self.y_true = np.array([1, 1, 2, 2, 3])
         self.y_pred = np.array(
             [
@@ -1995,11 +2003,11 @@ class CircleTest(testing.TestCase):
         self.setup()
         circle_loss = losses.Circle(gamma=80.0, margin=0.4)
         loss = circle_loss(self.y_true, self.y_pred)
-        self.assertAlmostEqual(loss, 188.3883)
+        self.assertAlmostEqual(loss, 188.3883, tpu_decimal=0)
 
         circle_loss = losses.Circle(gamma=256, margin=0.25)
         loss = circle_loss(self.y_true, self.y_pred)
-        self.assertAlmostEqual(loss, 652.7617)
+        self.assertAlmostEqual(loss, 652.7617, tpu_decimal=0)
 
         loss = losses.circle(
             self.y_true,
@@ -2012,7 +2020,10 @@ class CircleTest(testing.TestCase):
         )
 
         self.assertAllClose(
-            loss, (61.5844, 94.3465, 276.9344, 90.9873, 48.8963)
+            loss,
+            (61.5844, 94.3465, 276.9344, 90.9873, 48.8963),
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
 
     def test_correctness_weighted(self):
@@ -2022,7 +2033,7 @@ class CircleTest(testing.TestCase):
         loss = circle_loss(
             self.y_true, self.y_pred, sample_weight=sample_weight
         )
-        self.assertAlmostEqual(loss, 244.91918)
+        self.assertAlmostEqual(loss, 244.91918, tpu_decimal=0)
 
     def test_no_reduction(self):
         self.setup()
@@ -2030,7 +2041,10 @@ class CircleTest(testing.TestCase):
         loss = circle_loss(self.ref_labels, self.ref_embeddings)
 
         self.assertAllClose(
-            loss, [82.9116, 36.7942, 92.4590, 52.6798, 0.0, 0.0]
+            loss,
+            [82.9116, 36.7942, 92.4590, 52.6798, 0.0, 0.0],
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
 
     def test_sum_reduction(self):
@@ -2038,7 +2052,7 @@ class CircleTest(testing.TestCase):
         circle_loss = losses.Circle(gamma=80.0, margin=0.4, reduction="sum")
         loss = circle_loss(self.ref_labels, self.ref_embeddings)
 
-        self.assertAlmostEqual(loss, 264.845)
+        self.assertAlmostEqual(loss, 264.845, tpu_decimal=0)
 
     def test_mean_with_sample_weight_reduction(self):
         self.setup()
@@ -2049,7 +2063,7 @@ class CircleTest(testing.TestCase):
         loss = circle_loss(
             self.y_true, self.y_pred, sample_weight=sample_weight
         )
-        self.assertAlmostEqual(loss, 163.27948)
+        self.assertAlmostEqual(loss, 163.27948, tpu_decimal=0)
 
     def test_dtype_arg(self):
         self.setup()

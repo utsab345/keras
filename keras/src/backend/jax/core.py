@@ -1,3 +1,6 @@
+import inspect
+import math
+
 import jax
 import jax.experimental.sparse as jax_sparse
 import jax.numpy as jnp
@@ -20,35 +23,65 @@ from keras.src.backend.jax import distribution_lib
 
 SUPPORTS_SPARSE_TENSORS = True
 SUPPORTS_RAGGED_TENSORS = False
+SUPPORTS_COMPLEX_DTYPES = True
 IS_THREAD_SAFE = True
 
 
 class JaxVariable(KerasVariable):
-    def __init__(self, *args, layout=None, **kwargs):
-        # Intercept layout parameter so that it is available
-        # during initialization.
-        self._layout = layout
-        super().__init__(*args, **kwargs)
-
-    def _initialize(self, value):
-        # Note that variable.shape is needed by distribution_lib
-        self._shape = self._validate_shape(value.shape)
+    def _initialize_layout(self):
         # We can't import the keras/distribution/distribution_lib
         # due to circular dependency.
         distribution = global_state.get_global_attribute("distribution")
         if self._layout is None and distribution is not None:
-            tensor_layout = distribution.get_variable_layout(self)
-            from keras.src.distribution import TensorLayout
+            self._layout = distribution.get_variable_layout(self)
 
-            if isinstance(tensor_layout, TensorLayout):
-                self._layout = tensor_layout.backend_layout
-            else:
-                self._layout = tensor_layout
+    def _initialize(self, value):
+        # Note that variable.shape is needed by distribution_lib
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
         self._direct_assign(value)
+
+    def _initialize_with_initializer(self, initializer):
+        from keras.src.distribution.distribution_lib import TensorLayout
+
+        self._initialize_layout()
+        jax_layout = (
+            self._layout.backend_layout
+            if isinstance(self._layout, TensorLayout)
+            else self._layout
+        )
+
+        if self._layout is None:
+            super()._initialize_with_initializer(initializer)
+        elif "layout" in inspect.signature(initializer).parameters:
+            with jax.set_mesh(jax_layout.mesh):
+                # Force explicit axes in this context, otherwise `out_sharding`
+                # in ops ends up being ignored.
+
+                @jax.sharding.explicit_axes
+                def explicit_initializer():
+                    explicit_layout = jax.sharding.NamedSharding(
+                        jax.sharding.get_abstract_mesh(), jax_layout.spec
+                    )
+                    return initializer(
+                        self._shape, dtype=self._dtype, layout=explicit_layout
+                    )
+
+                self._value = explicit_initializer(in_sharding=None)
+        elif should_shard_at_init(jax_layout, self._shape):
+            jitted_initializer = jax.jit(
+                initializer.__call__,
+                out_shardings=jax_layout,
+                static_argnames=["shape", "dtype"],
+            )
+            value = jitted_initializer(shape=self._shape, dtype=self._dtype)
+            self._value = value
+        else:
+            super()._initialize_with_initializer(initializer)
 
     def _direct_assign(self, value):
         if self._layout is not None:
-            value = distribution_lib.distribute_variable(value, self._layout)
+            value = distribution_lib.distribute_tensor(value, self._layout)
         self._value = value
 
     def _convert_to_tensor(self, value, dtype=None):
@@ -80,7 +113,7 @@ if config.is_nnx_enabled():
         ):
             # Ensure 'mutable' is in nnx_metadata, but explicit 'mutable'
             # param takes precedence.
-            nnx_metadata["mutable"] = trainable if mutable is None else mutable
+            nnx_metadata["mutable"] = True if mutable is None else mutable
 
             # First, initialize a basic nnx.Variable with a dummy value
             # This sets up the NNX variable structure
@@ -91,9 +124,6 @@ if config.is_nnx_enabled():
 
             # Initialize nnx.Variable first
             nnx.Variable.__init__(self, value=dummy_value, **nnx_metadata)
-
-            # Now we can safely set layout
-            self._layout = layout
 
             # Initialize JaxVariable (which will call KerasVariable.__init__
             # and set up the real value).
@@ -107,10 +137,17 @@ if config.is_nnx_enabled():
                 aggregation=aggregation,
                 synchronization=synchronization,
                 name=name,
+                layout=layout,
             )
 
             # The real value is now set in self._value, sync it to raw_value
             object.__setattr__(self, "raw_value", self._value)
+
+        def _initialize_with_initializer(self, initializer):
+            value = self._convert_to_tensor(
+                initializer(self._shape, dtype=self._dtype)
+            )
+            self._initialize(value)
 
         @property
         def _value(self):
@@ -190,9 +227,7 @@ if config.is_nnx_enabled():
         def _direct_assign(self, value):
             # Apply JAX-specific distribution if layout is present
             if self._layout is not None:
-                value = distribution_lib.distribute_variable(
-                    value, self._layout
-                )
+                value = distribution_lib.distribute_tensor(value, self._layout)
 
             # Apply on_set_value hook if it exists
             if (
@@ -233,6 +268,68 @@ if config.is_nnx_enabled():
             return self._maybe_autocast(current_value)
 
     Variable = NnxVariable
+
+    def _flatten_nnx_variable(variable):
+        children = (variable.raw_value,)
+        # We copy __dict__ to avoid side effects
+        keras_state = variable.__dict__.copy()
+        # Remove elements that might be problematic or redundant if
+        # nnx.Variable's __getstate__
+        keras_state.pop("raw_value", None)
+        aux_data = (
+            variable._var_metadata,
+            getattr(variable, "_trace_state", None),
+            keras_state,
+        )
+        return children, aux_data
+
+    def _unflatten_nnx_variable(aux_data, children):
+        var_metadata, trace_state, keras_state = aux_data
+        raw_value = children[0]
+
+        # Create uninitialized instance
+        variable = NnxVariable.__new__(NnxVariable)
+
+        # Restore state
+        variable._var_metadata = var_metadata
+        if trace_state is not None:
+            variable._trace_state = trace_state
+        variable.__dict__.update(keras_state)
+        variable.raw_value = raw_value
+
+        return variable
+
+    try:
+        jax.tree_util.register_pytree_node(
+            NnxVariable,
+            _flatten_nnx_variable,
+            _unflatten_nnx_variable,
+        )
+    except ValueError:
+        pass
+
+    def __setattr__(self, name, value):
+        # Mirror Keras attributes to _var_metadata to ensure persistence
+        # if the Pytree registration is not respected by NNX.
+        if (
+            name != "_var_metadata"
+            and name not in ("_raw_value", "_trace_state")
+            and hasattr(self, "_var_metadata")
+        ):
+            self._var_metadata[name] = value
+
+        object.__setattr__(self, name, value)
+
+    NnxVariable.__setattr__ = __setattr__
+
+
+def should_shard_at_init(init_layout, shape):
+    size_threshold = 250 * 1024 * 1024
+    # We multiply by the mesh size here to take into account the worst case
+    # scenario of the array being first duplicated in the memory of one device
+    # before being transferred to the other devices.
+    size = math.prod(shape) * 4 * init_layout.mesh.devices.size
+    return size >= size_threshold
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
@@ -429,12 +526,23 @@ def scatter(indices, values, shape):
     return zeros.at[key].add(values)
 
 
-def scatter_update(inputs, indices, updates):
+def scatter_update(inputs, indices, updates, reduction=None):
     inputs = convert_to_tensor(inputs)
     indices = jnp.array(indices)
     indices = jnp.transpose(indices)
-    inputs = inputs.at[tuple(indices)].set(updates)
-    return inputs
+    idx = tuple(indices)
+    if reduction is None:
+        return inputs.at[idx].set(updates)
+    elif reduction == "add":
+        return inputs.at[idx].add(updates)
+    elif reduction == "max":
+        return inputs.at[idx].max(updates)
+    elif reduction == "min":
+        return inputs.at[idx].min(updates)
+    elif reduction == "mul":
+        return inputs.at[idx].multiply(updates)
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
 
 
 def slice(inputs, start_indices, shape):
@@ -514,7 +622,17 @@ def random_seed_dtype():
 
 
 def custom_gradient(fun):
-    return jax.custom_gradient(fun=fun)
+    fun_with_custom_gradient = jax.custom_gradient(fun=fun)
+
+    # Add a wrapper to unwrap variables, otherwise custom_gradient will fail
+    def fun_with_custom_gradient_wrapper(*args, **kwargs):
+        args, kwargs = tree.map_shape_structure(
+            lambda x: x.value if isinstance(x, KerasVariable) else x,
+            (args, kwargs),
+        )
+        return fun_with_custom_gradient(*args, **kwargs)
+
+    return fun_with_custom_gradient_wrapper
 
 
 def remat(f):

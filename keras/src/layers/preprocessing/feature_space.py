@@ -1,3 +1,5 @@
+import numpy as np
+
 from keras.src import backend
 from keras.src import layers
 from keras.src import tree
@@ -507,10 +509,14 @@ class FeatureSpace(Layer):
 
     def adapt(self, dataset):
         if not isinstance(dataset, tf.data.Dataset):
-            raise ValueError(
-                "`adapt()` can only be called on a tf.data.Dataset. "
-                f"Received instead: {dataset} (of type {type(dataset)})"
-            )
+            if isinstance(dataset, dict):
+                dataset = tf.data.Dataset.from_tensor_slices(dataset)
+            else:
+                raise ValueError(
+                    "`adapt()` can only be called on a tf.data.Dataset or a "
+                    "dict of arrays/lists. "
+                    f"Received instead: {dataset} (of type {type(dataset)})"
+                )
 
         for name in self._list_adaptable_preprocessors():
             # Call adapt() on each individual adaptable layer.
@@ -740,12 +746,16 @@ class FeatureSpace(Layer):
 
         if rebatched:
             if self.output_mode == "concat":
-                assert merged_data.shape[0] == 1
+                if merged_data.shape[0] != 1:
+                    raise ValueError(
+                        "Expected rebatched data to have batch size 1. "
+                        f"Received: shape={merged_data.shape}"
+                    )
                 if (
                     backend.backend() != "tensorflow"
                     and not backend_utils.in_tf_graph()
                 ):
-                    merged_data = backend.convert_to_numpy(merged_data)
+                    merged_data = np.array(merged_data)
                 merged_data = tf.squeeze(merged_data, axis=0)
             else:
                 for name, x in merged_data.items():

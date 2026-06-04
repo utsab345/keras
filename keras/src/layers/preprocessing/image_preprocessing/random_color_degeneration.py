@@ -2,6 +2,9 @@ from keras.src.api_export import keras_export
 from keras.src.layers.preprocessing.image_preprocessing.base_image_preprocessing_layer import (  # noqa: E501
     BaseImagePreprocessingLayer,
 )
+from keras.src.layers.preprocessing.image_preprocessing.base_image_preprocessing_layer import (  # noqa: E501
+    base_image_preprocessing_color_example,
+)
 from keras.src.random import SeedGenerator
 
 
@@ -29,6 +32,10 @@ class RandomColorDegeneration(BaseImagePreprocessingLayer):
             passed float is sampled. In order to ensure the value is always the
             same, please pass a tuple with two identical floats: `(0.5, 0.5)`.
         seed: Integer. Used to create a random seed.
+
+    Example:
+
+    {{base_image_preprocessing_color_example}}
     """
 
     _VALUE_RANGE_VALIDATION_ERROR = (
@@ -132,4 +139,26 @@ class RandomColorDegeneration(BaseImagePreprocessingLayer):
         return config
 
     def compute_output_shape(self, input_shape):
+        if len(input_shape) not in (3, 4):
+            raise ValueError(
+                "Invalid images rank: expected rank 3 (single image) "
+                "or rank 4 (batch of images). "
+                f"Received: input_shape={input_shape}"
+            )
+        channels_axis = -1 if self.data_format == "channels_last" else -3
+        channels = input_shape[channels_axis]
+        if channels is not None and channels != 3:
+            raise ValueError(
+                "Input images must have 3 channels, but received images with "
+                f"{channels} channels."
+            )
         return input_shape
+
+
+if RandomColorDegeneration.__doc__ is not None:
+    RandomColorDegeneration.__doc__ = RandomColorDegeneration.__doc__.replace(
+        "{{base_image_preprocessing_color_example}}",
+        base_image_preprocessing_color_example.replace(
+            "{LayerName}", "RandomColorDegeneration"
+        ),
+    )
