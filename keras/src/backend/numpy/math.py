@@ -304,7 +304,8 @@ def istft(
 
 
 def rsqrt(x):
-    return 1.0 / np.sqrt(x)
+    dtype = dtypes.result_type(x.dtype)
+    return (1.0 / np.sqrt(x)).astype(dtype)
 
 
 def erf(x):
@@ -318,7 +319,9 @@ def erfc(x):
 
 
 def erfinv(x):
-    return np.array(scipy.special.erfinv(x))
+    x = convert_to_tensor(x)
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.erfinv(x).astype(dtype)
 
 
 def logdet(x):

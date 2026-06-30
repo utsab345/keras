@@ -288,6 +288,7 @@ def istft(
 
 
 def rsqrt(x):
+    x = convert_to_tensor(x)
     return tf.math.rsqrt(x)
 
 
@@ -301,6 +302,15 @@ def erfc(x):
 
 
 def erfinv(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ["bfloat16", "float16"]:
+        return tf.cast(
+            tf.math.erfinv(tf.cast(x, tf.float32)),
+            dtype,
+        )
+
     return tf.math.erfinv(x)
 
 

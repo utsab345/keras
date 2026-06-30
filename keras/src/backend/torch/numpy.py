@@ -1331,6 +1331,20 @@ def minimum(x1, x2):
     return torch.minimum(x1, x2)
 
 
+def fmin(x1, x2):
+    if not isinstance(x1, (int, float)):
+        x1 = convert_to_tensor(x1)
+    if not isinstance(x2, (int, float)):
+        x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+    return torch.fmin(x1, x2)
+
+
 def mod(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -1387,12 +1401,12 @@ def nanargmin(x, axis=None, keepdims=False):
 
 
 def nancumsum(x, axis=None, dtype=None):
-    x = nan_to_num(x)
+    x = nan_to_num(x, posinf=float("inf"), neginf=float("-inf"))
     return cumsum(x, axis=axis, dtype=dtype)
 
 
 def nancumprod(x, axis=None, dtype=None):
-    x = nan_to_num(x, nan=1.0)
+    x = nan_to_num(x, nan=1.0, posinf=float("inf"), neginf=float("-inf"))
     return cumprod(x, axis=axis, dtype=dtype)
 
 
@@ -2121,11 +2135,15 @@ def divide(x1, x2):
 
 
 def divide_no_nan(x1, x2):
-    if not isinstance(x1, (int, float)):
-        x1 = convert_to_tensor(x1)
-    if not isinstance(x2, (int, float)):
-        x2 = convert_to_tensor(x2)
-    return torch.where(x2 == 0, 0, torch.divide(x1, x2))
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+        float,
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+    safe_x2 = torch.where(x2 == 0, torch.ones_like(x2), x2)
+    return torch.where(x2 == 0, 0, torch.divide(x1, safe_x2))
 
 
 def true_divide(x1, x2):

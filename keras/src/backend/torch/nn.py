@@ -1461,7 +1461,19 @@ def dot_product_attention(
 
     mask = mask if mask is None else convert_to_tensor(mask, dtype="bool")
     if mask is not None:
-        # Explicit set `is_causal` to `False` when `mask` is not `None`.
+        if is_causal:
+            # `scaled_dot_product_attention` treats `attn_mask` and
+            # `is_causal` as mutually exclusive, so a caller-provided mask
+            # would otherwise silently drop the causal constraint. Fold the
+            # causal mask into the explicit mask to honor both.
+            q_len, kv_len = query.shape[1], key.shape[1]
+            causal_mask = torch.tril(
+                torch.ones(
+                    (q_len, kv_len), dtype=torch.bool, device=mask.device
+                )
+            )
+            mask = torch.logical_and(mask, causal_mask)
+        # Explicitly set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
     if bias is not None:
@@ -1472,6 +1484,13 @@ def dot_product_attention(
     query = torch.transpose(query, axis0, axis1)
     key = torch.transpose(key, axis0, axis1)
     value = torch.transpose(value, axis0, axis1)
+
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    if num_query_heads > num_kv_heads and num_kv_heads > 1:
+        groups = num_query_heads // num_kv_heads
+        key = torch.repeat_interleave(key, repeats=groups, dim=1)
+        value = torch.repeat_interleave(value, repeats=groups, dim=1)
 
     if flash_attention is None:
         flash_attention = _can_use_flash_attention(

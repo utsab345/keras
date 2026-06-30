@@ -605,7 +605,7 @@ def save_weights_only(
     finally:
         if tmp_dir is not None:
             file_utils.copy(filepath, remote_filepath)
-            shutil.rmtree(tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def load_weights_only(
@@ -667,7 +667,7 @@ def load_weights_only(
             _raise_loading_failure(error_msgs, warn_only=skip_mismatch)
     finally:
         if tmp_dir is not None:
-            shutil.rmtree(tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _raise_loading_failure(error_msgs, warn_only=False):
@@ -1021,19 +1021,45 @@ def _load_container_state(
             if not _container_path_present(
                 weights_store, assets_store, nested_path
             ):
-                # Legacy files saved before PR #22362 didn't write the
-                # `container*` groups for nested containers — silently
-                # skip so the model still loads (sublayers keep their
-                # freshly-initialized weights).
-                warnings.warn(
-                    f"Skipping nested container at '{nested_path}': no "
-                    "matching group found in the saved file. This usually "
-                    "means the file was saved with a Keras version that "
-                    "did not serialize sublayers nested inside containers. "
-                    "Affected layers will retain their freshly-initialized "
-                    "weights.",
-                    stacklevel=2,
+                # The container's group is missing from the saved file.
+                # Try to load it recursively anyway with `skip_mismatch=True`,
+                # then warn only if doing so produced new failures — i.e. the
+                # container genuinely held an unvisited `KerasSaveable` that
+                # needed loading. This silently skips two benign cases:
+                #   - Containers of pure metadata (e.g. lists of strings in
+                #     `variable_serialization_spec`).
+                #   - Containers that mirror already-loaded saveables (e.g.
+                #     a Functional model's `_operations_by_depth` whose
+                #     items are also in the `layers` collection).
+                tracked_failures = (
+                    failed_saveables if failed_saveables is not None else set()
                 )
+                failed_before = len(tracked_failures)
+                _load_container_state(
+                    saveable,
+                    weights_store,
+                    assets_store,
+                    inner_path=nested_path,
+                    skip_mismatch=True,
+                    visited_saveables=visited_saveables,
+                    failed_saveables=tracked_failures,
+                    error_msgs=error_msgs,
+                    visited_containers=visited_containers,
+                )
+                if len(tracked_failures) > failed_before:
+                    # Legacy files saved before PR #22362 didn't write the
+                    # `container*` groups for nested containers — silently
+                    # skip so the model still loads (sublayers keep their
+                    # freshly-initialized weights).
+                    warnings.warn(
+                        f"Skipping nested container at '{nested_path}': no "
+                        "matching group found in the saved file. This "
+                        "usually means the file was saved with a Keras "
+                        "version that did not serialize sublayers nested "
+                        "inside containers. Affected layers will retain "
+                        "their freshly-initialized weights.",
+                        stacklevel=2,
+                    )
                 continue
             _load_container_state(
                 saveable,
@@ -1147,20 +1173,32 @@ def safe_get_h5_group(parent, name):
     Returns:
         The child h5py.Group.
     """
-    # Also handles the case when the group is an empty dict initially.
-    if name not in parent:
-        raise KeyError(name)
+    current = parent
+    for name_part in name.split("/"):
+        if not name_part:
+            raise ValueError(f"Invalid path in H5 file: {name}")
 
-    group_type = parent.get(name, default=None, getclass=True, getlink=True)
-    if group_type in (h5py.ExternalLink, h5py.SoftLink):
-        raise ValueError(f"Not allowed: H5 file with {group_type.__name__}")
+        # Also handles the case when the group is an empty dict initially.
+        if name_part not in current:
+            raise KeyError(name)
 
-    group = parent[name]
-    if not isinstance(group, h5py.Group):
-        raise ValueError(
-            f"Invalid H5 file, expected Group but received {type(group)}"
-        )
-    return group
+        if isinstance(current, dict):
+            group_type = None
+        else:
+            group_type = current.get(
+                name_part, default=None, getclass=True, getlink=True
+            )
+
+        if group_type in (h5py.ExternalLink, h5py.SoftLink):
+            raise ValueError(f"Not allowed: H5 file with {group_type.__name__}")
+
+        current = current[name_part]
+        if not isinstance(current, h5py.Group):
+            raise ValueError(
+                f"Invalid H5 file, expected Group but received {type(current)}"
+            )
+
+    return current
 
 
 # Guard against HDF5 "shape bomb" datasets: a dataset can declare an enormous
@@ -1184,6 +1222,11 @@ def safe_get_h5_dataset(group, name):
     Returns:
         The child h5py.Dataset.
     """
+    if "/" in name:
+        # Separate the dataset name from it's parent group.
+        group_name, name = name.rsplit("/", 1)
+        group = safe_get_h5_group(group, group_name)
+
     # Also handles the case when the group is an empty dict initially.
     if name not in group:
         raise KeyError(name)
@@ -1763,7 +1806,7 @@ class NpzIOStore:
                 self.f = archive.open(root_path, mode="r")
             else:
                 self.f = open(root_path, mode="rb")
-            self.contents = np.load(self.f)
+            self.contents = np.load(self.f, allow_pickle=False)
 
     def make(self, path, metadata=None):
         if not path:

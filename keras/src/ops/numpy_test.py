@@ -338,6 +338,11 @@ class NumpyTwoInputOpsDynamicShapeTest(testing.TestCase):
         y = KerasTensor((2, None))
         self.assertEqual(knp.minimum(x, y).shape, (2, 3))
 
+    def test_fmin(self):
+        x = KerasTensor((None, 3))
+        y = KerasTensor((2, None))
+        self.assertEqual(knp.fmin(x, y).shape, (2, 3))
+
     def test_mod(self):
         x = KerasTensor((None, 3))
         y = KerasTensor((2, None))
@@ -1072,6 +1077,19 @@ class NumpyTwoInputOpsStaticShapeTest(testing.TestCase):
             x = KerasTensor((2, 3))
             y = KerasTensor((2, 3, 4))
             knp.minimum(x, y)
+
+    def test_fmin(self):
+        x = KerasTensor((2, 3))
+        y = KerasTensor((2, 3))
+        self.assertEqual(knp.fmin(x, y).shape, (2, 3))
+
+        x = KerasTensor((2, 3))
+        self.assertEqual(knp.fmin(x, 2).shape, (2, 3))
+
+        with self.assertRaises(ValueError):
+            x = KerasTensor((2, 3))
+            y = KerasTensor((2, 3, 4))
+            knp.fmin(x, y)
 
     def test_mod(self):
         x = KerasTensor((2, 3))
@@ -3508,6 +3526,45 @@ class NumpyTwoInputOpsCorrectnessTest(testing.TestCase):
         self.assertAllClose(knp.divide_no_nan(x, y), expected_result)
         self.assertAllClose(knp.DivideNoNan()(x, y), expected_result)
 
+    @pytest.mark.skipif(
+        backend.backend() not in ("tensorflow", "jax", "torch"),
+        reason=f"{backend.backend()} backend does not support gradients.",
+    )
+    def test_divide_no_nan_gradients(self):
+        expected_x1_grad = np.array([0.0, 0.5], dtype="float32")
+        expected_x2_grad = np.array([0.0, -0.5], dtype="float32")
+
+        if backend.backend() == "tensorflow":
+            import tensorflow as tf
+
+            x1 = tf.Variable([1.0, 2.0])
+            x2 = tf.Variable([0.0, 2.0])
+            with tf.GradientTape() as tape:
+                y = knp.divide_no_nan(x1, x2)
+                loss = tf.reduce_sum(y)
+            x1_grad, x2_grad = tape.gradient(loss, [x1, x2])
+        elif backend.backend() == "jax":
+            import jax
+            import jax.numpy as jnp
+
+            def f(x1, x2):
+                return jnp.sum(knp.divide_no_nan(x1, x2))
+
+            x1 = jnp.array([1.0, 2.0])
+            x2 = jnp.array([0.0, 2.0])
+            x1_grad, x2_grad = jax.grad(f, argnums=(0, 1))(x1, x2)
+        elif backend.backend() == "torch":
+            import torch
+
+            x1 = torch.tensor([1.0, 2.0], requires_grad=True)
+            x2 = torch.tensor([0.0, 2.0], requires_grad=True)
+            y = knp.divide_no_nan(x1, x2)
+            y.sum().backward()
+            x1_grad, x2_grad = x1.grad, x2.grad
+
+        self.assertAllClose(ops.convert_to_numpy(x1_grad), expected_x1_grad)
+        self.assertAllClose(ops.convert_to_numpy(x2_grad), expected_x2_grad)
+
     def test_true_divide(self):
         x = np.array([[1, 2, 3], [3, 2, 1]])
         y = np.array([[4, 5, 6], [3, 2, 1]])
@@ -4203,6 +4260,17 @@ class NumpyTwoInputOpsCorrectnessTest(testing.TestCase):
         self.assertAllClose(knp.Minimum()(x, y), np.minimum(x, y))
         self.assertAllClose(knp.Minimum()(x, 1), np.minimum(x, 1))
         self.assertAllClose(knp.Minimum()(1, x), np.minimum(1, x))
+
+    def test_fmin(self):
+        x = np.array([[1.0, np.nan], [3.0, 4.0]])
+        y = np.array([[5.0, 6.0], [np.nan, 8.0]])
+        self.assertAllClose(knp.fmin(x, y), np.fmin(x, y))
+        self.assertAllClose(knp.fmin(x, 1.0), np.fmin(x, 1.0))
+        self.assertAllClose(knp.fmin(1.0, x), np.fmin(1.0, x))
+
+        self.assertAllClose(knp.Fmin()(x, y), np.fmin(x, y))
+        self.assertAllClose(knp.Fmin()(x, 1.0), np.fmin(x, 1.0))
+        self.assertAllClose(knp.Fmin()(1.0, x), np.fmin(1.0, x))
 
     def test_mod(self):
         x = np.array([[1, 2], [3, 4]])
@@ -7115,6 +7183,14 @@ class NumpyOneInputOpsCorrectnessTest(testing.TestCase):
             knp.nancumsum(x_all_nan, axis=1), np.nancumsum(x_all_nan, axis=1)
         )
 
+        x_with_inf = np.array(
+            [[np.nan, np.inf, 1.0], [np.nan, -np.inf, -1.0]], dtype=np.float32
+        )
+        self.assertAllClose(
+            knp.nancumsum(x_with_inf, axis=1),
+            np.nancumsum(x_with_inf, axis=1),
+        )
+
     def test_nancumprod(self):
         x = np.array([[1.0, np.nan, 3.0], [np.nan, 2.0, -1.0]])
 
@@ -7144,6 +7220,13 @@ class NumpyOneInputOpsCorrectnessTest(testing.TestCase):
         self.assertAllClose(
             knp.nancumprod(x_all_nan, axis=1),
             np.nancumprod(x_all_nan, axis=1),
+        )
+
+        x_with_inf = np.array(
+            [[np.nan, np.inf, -np.inf], [2.0, np.nan, -3.0]], dtype=np.float32
+        )
+        self.assertAllClose(
+            knp.nancumprod(x_with_inf), np.nancumprod(x_with_inf)
         )
 
     def test_nanmax(self):
@@ -10848,6 +10931,27 @@ class NumpyDtypeTest(testing.TestCase):
 
         self.assertDType(knp.minimum(x, 1.0), expected_dtype)
         self.assertDType(knp.Minimum().symbolic_call(x, 1.0), expected_dtype)
+
+    @parameterized.named_parameters(
+        named_product(dtypes=itertools.combinations(ALL_DTYPES, 2))
+    )
+    def test_fmin(self, dtypes):
+        import jax.numpy as jnp
+
+        dtype1, dtype2 = dtypes
+        x1 = knp.ones((), dtype=dtype1)
+        x2 = knp.ones((), dtype=dtype2)
+        x1_jax = jnp.ones((), dtype=dtype1)
+        x2_jax = jnp.ones((), dtype=dtype2)
+        expected_dtype = standardize_dtype(jnp.fmin(x1_jax, x2_jax).dtype)
+
+        self.assertEqual(
+            standardize_dtype(knp.fmin(x1, x2).dtype), expected_dtype
+        )
+        self.assertEqual(
+            standardize_dtype(knp.Fmin().symbolic_call(x1, x2).dtype),
+            expected_dtype,
+        )
 
     @parameterized.named_parameters(
         named_product(dtypes=itertools.combinations(ALL_DTYPES, 2))

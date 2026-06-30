@@ -1124,7 +1124,6 @@ def rsqrt(x):
     """
     if any_symbolic_tensors((x,)):
         return Rsqrt().symbolic_call(x)
-    x = backend.convert_to_tensor(x)
     return backend.math.rsqrt(x)
 
 
@@ -1213,7 +1212,6 @@ def erfinv(x):
     """
     if any_symbolic_tensors((x,)):
         return Erfinv().symbolic_call(x)
-    x = backend.convert_to_tensor(x)
     return backend.math.erfinv(x)
 
 

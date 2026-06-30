@@ -282,6 +282,7 @@ def istft(
 
 
 def rsqrt(x):
+    x = convert_to_tensor(x)
     return jax.lax.rsqrt(x)
 
 
@@ -295,7 +296,8 @@ def erfc(x):
 
 
 def erfinv(x):
-    return jax.lax.erf_inv(x)
+    x = convert_to_tensor(x)
+    return jax.scipy.special.erfinv(x)
 
 
 def logdet(x):

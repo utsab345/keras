@@ -2249,6 +2249,32 @@ def minimum(x1, x2):
     return tf.minimum(x1, x2)
 
 
+def fmin(x1, x2):
+    if not isinstance(x1, (int, float)):
+        x1 = convert_to_tensor(x1)
+    if not isinstance(x2, (int, float)):
+        x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+
+    if "float" not in standardize_dtype(dtype):
+        return tf.minimum(x1, x2)
+
+    nan_x1 = tf.math.is_nan(x1)
+    nan_x2 = tf.math.is_nan(x2)
+
+    res = tf.minimum(x1, x2)
+
+    res = tf.where(tf.logical_and(nan_x1, tf.logical_not(nan_x2)), x2, res)
+
+    res = tf.where(tf.logical_and(nan_x2, tf.logical_not(nan_x1)), x1, res)
+    return res
+
+
 def mod(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -2336,12 +2362,12 @@ def nanargmin(x, axis=None, keepdims=False):
 
 
 def nancumsum(x, axis=None, dtype=None):
-    x = nan_to_num(x)
+    x = nan_to_num(x, posinf=float("inf"), neginf=float("-inf"))
     return cumsum(x, axis=axis, dtype=dtype)
 
 
 def nancumprod(x, axis=None, dtype=None):
-    x = nan_to_num(x, nan=1.0)
+    x = nan_to_num(x, nan=1.0, posinf=float("inf"), neginf=float("-inf"))
     return cumprod(x, axis=axis, dtype=dtype)
 
 
@@ -3867,32 +3893,34 @@ def unique(
 
     if is_flatten:
         x = tf.reshape(x, [-1])
-        dim = 0
-        y, inverse, counts = tf.unique_with_counts(x)
+        axis = 0
+        if return_counts:
+            y, inverse, counts = tf.unique_with_counts(x)
+        else:
+            y, inverse = tf.unique(x)
 
     else:
-        ndim = x.shape.rank
-        dim = axis + ndim if axis < 0 else axis
-        axis_to_use = tf.constant([dim], dtype=tf.int32)
-        y, inverse, counts = tf.raw_ops.UniqueWithCountsV2(
-            x=x, axis=axis_to_use, out_idx=tf.int32
-        )
+        axis = canonicalize_axis(axis, x.shape.rank)
+        if return_counts:
+            y, inverse, counts = tf.raw_ops.UniqueWithCountsV2(x=x, axis=[axis])
+        else:
+            y, inverse = tf.raw_ops.UniqueV2(x=x, axis=[axis])
 
     if return_index:
-        num_unique = tf.shape(y)[dim]
-        dim_size = tf.shape(x)[0] if is_flatten else original_shape[dim]
+        num_unique = tf.shape(y)[axis]
+        axis_dim = tf.shape(x)[0] if is_flatten else original_shape[axis]
         unique_indices = tf.math.unsorted_segment_min(
-            tf.range(dim_size, dtype=tf.int32), inverse, num_unique
+            tf.range(axis_dim, dtype=tf.int32), inverse, num_unique
         )
 
     if sorted:
-        num_unique = tf.shape(y)[dim]
+        num_unique = tf.shape(y)[axis]
         if is_flatten or y.shape.rank == 1:
             sort_order = tf.argsort(y)
         else:
             # Multi-D lexicographical sort
             perm = list(range(y.shape.rank))
-            perm[0], perm[dim] = perm[dim], perm[0]
+            perm[0], perm[axis] = perm[axis], perm[0]
             y_transposed = tf.transpose(y, perm)
             y_2d = tf.reshape(y_transposed, [num_unique, -1])
             num_cols = tf.shape(y_2d)[1]
@@ -3911,7 +3939,7 @@ def unique(
                 cond, body, [num_cols - 1, sort_order], parallel_iterations=1
             )
 
-        y = tf.gather(y, sort_order, axis=dim)
+        y = tf.gather(y, sort_order, axis=axis)
         if return_index:
             unique_indices = tf.gather(unique_indices, sort_order)
         if return_counts:
@@ -3923,11 +3951,11 @@ def unique(
 
     # Static size padding/truncation (branchless logic for graph mode safety)
     if size is not None:
-        values_count = tf.shape(y)[dim]
+        values_count = tf.shape(y)[axis]
 
         # 1. Truncate using gather
         truncate_size = tf.minimum(values_count, size)
-        y = tf.gather(y, tf.range(truncate_size), axis=dim)
+        y = tf.gather(y, tf.range(truncate_size), axis=axis)
         if return_index:
             unique_indices = tf.gather(unique_indices, tf.range(truncate_size))
         if return_counts:
@@ -3937,7 +3965,7 @@ def unique(
         pad_amount = tf.maximum(0, size - values_count)
         paddings = tf.zeros([tf.rank(y), 2], dtype=tf.int32)
         paddings = tf.tensor_scatter_nd_update(
-            paddings, [[dim, 1]], [pad_amount]
+            paddings, [[axis, 1]], [pad_amount]
         )
 
         fill = tf.cast(0 if fill_value is None else fill_value, y.dtype)
@@ -3951,14 +3979,15 @@ def unique(
         if return_counts:
             counts = tf.pad(counts, [[0, pad_amount]], constant_values=0)
 
-        # 3. Enforce static shape for JAX/XLA compatibility
-        static_shape = y.shape.as_list()
-        static_shape[dim] = size
-        y.set_shape(static_shape)
-        if return_index:
-            unique_indices.set_shape([size])
-        if return_counts:
-            counts.set_shape([size])
+        # 3. Enforce static shape for XLA compatibility
+        if isinstance(size, int):
+            static_shape = y.shape.as_list()
+            static_shape[axis] = size
+            y.set_shape(static_shape)
+            if return_index:
+                unique_indices.set_shape([size])
+            if return_counts:
+                counts.set_shape([size])
 
     if return_inverse and is_flatten:
         inverse = tf.reshape(inverse, original_shape)
