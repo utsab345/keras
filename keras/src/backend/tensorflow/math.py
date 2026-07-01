@@ -311,14 +311,17 @@ def erfinv(x):
     if dtype in ["bfloat16", "float16"]:
         x = tf.cast(x, tf.float32)
         epsilon = tf.constant(1e-7, dtype=tf.float32)
-        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        clamped_x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        x = tf.where(tf.abs(x) < 1.0, clamped_x, x)
         return tf.cast(tf.math.erfinv(x), dtype)
     if dtype == "float32":
         epsilon = tf.constant(1e-7, dtype=tf.float32)
-        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        clamped_x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        x = tf.where(tf.abs(x) < 1.0, clamped_x, x)
     elif dtype == "float64":
         epsilon = tf.constant(1e-15, dtype=tf.float64)
-        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        clamped_x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        x = tf.where(tf.abs(x) < 1.0, clamped_x, x)
 
     return tf.math.erfinv(x)
 
