@@ -305,11 +305,20 @@ def erfinv(x):
     x = convert_to_tensor(x)
     dtype = standardize_dtype(x.dtype)
 
+    # Clamp to avoid numerical overflow (inf) for inputs extremely close
+    # to ±1.0 where tf.math.erfinv returns inf despite the input being
+    # strictly less than 1.0 (e.g. np.nextafter(float32(1.0), 0.0)).
     if dtype in ["bfloat16", "float16"]:
-        return tf.cast(
-            tf.math.erfinv(tf.cast(x, tf.float32)),
-            dtype,
-        )
+        x = tf.cast(x, tf.float32)
+        epsilon = tf.constant(1e-7, dtype=tf.float32)
+        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        return tf.cast(tf.math.erfinv(x), dtype)
+    if dtype == "float32":
+        epsilon = tf.constant(1e-7, dtype=tf.float32)
+        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+    elif dtype == "float64":
+        epsilon = tf.constant(1e-15, dtype=tf.float64)
+        x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
 
     return tf.math.erfinv(x)
 
